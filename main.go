@@ -237,7 +237,7 @@ func main() {
 	pwd := flag.String("pass", "12345", "Password for MySQL DB")
 	flag.Parse()
 	ndbworkers := 3
-	nprobeworkers := 3
+	nprobeworkers := 8
 	dsn := fmt.Sprintf("%s:%s@tcp(localhost:3306)", *usr, *pwd)
 	filter := newFilter()
 	db := &db{name: "information_schema"}
