@@ -6,30 +6,92 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	neturl "net/url"
+	"os"
 	"strings"
 	"sync"
 
 	_ "github.com/go-sql-driver/mysql"
 )
 
+type deeperr struct {
+	err  error
+	orig error
+}
+
+func (e *deeperr) Error() string {
+	return e.err.Error()
+}
+
+func (e *deeperr) Orig() error {
+	return e.orig
+}
+
+func errorf(sfmt string, args ...interface{}) *deeperr {
+	var (
+		oerr *deeperr
+		orig error
+	)
+	for a := range args {
+		if e, ok := args[a].(error); ok {
+			if e, ok := args[a].(*deeperr); ok {
+				oerr = e
+				break
+			}
+			orig = e
+			break
+		}
+	}
+	if oerr == nil {
+		oerr = &deeperr{orig: orig}
+	}
+	oerr.err = fmt.Errorf(sfmt, args...)
+	if oerr.orig == nil {
+		oerr.orig = oerr.err
+	}
+	return oerr
+}
+
+func explain(err error) string {
+	if err == nil {
+		return "domain not in certificate or certificate not installed"
+	}
+	e, ok := err.(*deeperr)
+	if ok {
+		err = e.orig
+	}
+	switch te := err.(type) {
+	case *net.OpError:
+		if _, ok := te.Err.(*os.SyscallError); ok {
+			return "vhost is not configured for port 443"
+		}
+		return explain(te.Err)
+	case *net.DNSError:
+		return "host not registered in DNS"
+	}
+	return fmt.Sprintf("original error: %s", err.Error())
+}
+
+type temporary interface {
+	Temporary() bool
+}
+
 type entry struct {
-	src string
+	src    string
 	domain string
-	err error
+	err    error
 }
 
 func (e *entry) toCsv() string {
 	var estr, esrc string
-	if e.err != nil {
-		estr = strings.Replace(e.err.Error(), `"`, `\"`, 0)
-	}
 	// TODO: This should be done by the filter
 	esrc = e.src
 	if e.src[0:4] == "dev_" {
 		esrc = e.src[4:]
 	}
+	estr = strings.Replace(explain(e.err), `"`, `\"`, 0)
 	return fmt.Sprintf(`"%s","%s","%s"`, e.domain, esrc, estr)
 }
 
@@ -49,13 +111,13 @@ type db struct {
 func (db *db) databases(f *filter) ([]string, error) {
 	rows, err := db.conn.Query("SHOW DATABASES")
 	if err != nil {
-		return nil, fmt.Errorf("cannot query databases: %s", err)
+		return nil, errorf("cannot query databases: %s", err)
 	}
 	names := make([]string, 0)
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("cannot scan row: %s", err)
+			return nil, errorf("cannot scan row: %s", err)
 		}
 		if f.database(name) {
 			names = append(names, name)
@@ -67,12 +129,12 @@ func (db *db) databases(f *filter) ([]string, error) {
 func (db *db) domains(gen *generator) error {
 	rows, err := db.conn.Query("SELECT domainName FROM sys_domain")
 	if err != nil {
-		return fmt.Errorf("cannot query domains: %s", err)
+		return errorf("cannot query domains: %s", err)
 	}
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			return fmt.Errorf("cannot scan row: %s", err)
+			return errorf("cannot scan row: %s", err)
 		}
 		if gen.filter.record(name) {
 			gen.generate(newEntry(db.name, name))
@@ -84,7 +146,7 @@ func (db *db) domains(gen *generator) error {
 func (db *db) connect(dsn string) error {
 	var err error
 	if db.conn, err = sql.Open("mysql", fmt.Sprintf("%s/%s", dsn, db.name)); err != nil {
-		return fmt.Errorf("cannot connect to db: %s", err)
+		return errorf("cannot connect to db: %s", err)
 	}
 	return nil
 }
@@ -154,10 +216,10 @@ func newDBScanner(dsn string, wg *sync.WaitGroup) *dbscanner {
 func (s *dbscanner) scan(name string, gen *generator) error {
 	db := &db{name: name}
 	if err := db.connect(s.dsn); err != nil {
-		return fmt.Errorf("cannot scan table %s: %s", name, err)
+		return errorf("cannot scan table %s: %s", name, err)
 	}
 	if err := db.domains(gen); err != nil {
-		return fmt.Errorf("cannot scan table %s: %s", name, err)
+		return errorf("cannot scan table %s: %s", name, err)
 	}
 	db.close()
 	return nil
@@ -173,14 +235,29 @@ func (s *dbscanner) run(dbnames <-chan string, gen *generator) {
 }
 
 type prober struct {
-	in  <-chan *entry
-	out chan<- *entry
+	in      <-chan *entry
+	out     chan<- *entry
+	retries int
 }
 
-func (*prober) hasTLS(url string) (bool, error) {
-	_, err := http.Head(fmt.Sprintf("https://%s/", url))
-	if err == nil {
-		return true, nil
+func (p *prober) hasTLS(url string) (bool, error) {
+	var err error
+	for i := 0; i < p.retries; i++ {
+		// Do not perform any redirect
+		client := &http.Client{
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		_, err = client.Head(fmt.Sprintf("https://%s/", url))
+		if err == nil {
+			return true, nil
+		}
+		if te, ok := err.(temporary); ok {
+			if te.Temporary() {
+				continue
+			}
+		}
 	}
 	if e, ok := err.(*neturl.Error); ok {
 		err = e.Err
@@ -189,7 +266,7 @@ func (*prober) hasTLS(url string) (bool, error) {
 			return false, nil
 		}
 	}
-	return false, fmt.Errorf("cannot HEAD: %s", err)
+	return false, errorf("cannot HEAD: %s", err)
 }
 
 func (p *prober) run(wg *sync.WaitGroup) {
@@ -205,11 +282,11 @@ func (p *prober) run(wg *sync.WaitGroup) {
 	wg.Done()
 }
 
-func probeUrls(in <-chan *entry, out chan<- *entry, nworkers int) {
+func probeUrls(in <-chan *entry, out chan<- *entry, nworkers, nretries int) {
 	var wg sync.WaitGroup
 	wg.Add(nworkers)
 	for i := 0; i < nworkers; i++ {
-		p := &prober{in, out}
+		p := &prober{in, out, nretries}
 		go p.run(&wg)
 	}
 	wg.Wait()
@@ -236,6 +313,7 @@ func main() {
 	usr := flag.String("user", "root", "User name for MySQL DB")
 	pwd := flag.String("pass", "12345", "Password for MySQL DB")
 	flag.Parse()
+	nretries := 2
 	ndbworkers := 3
 	nprobeworkers := 8
 	dsn := fmt.Sprintf("%s:%s@tcp(localhost:3306)", *usr, *pwd)
@@ -253,7 +331,7 @@ func main() {
 	broken := make(chan *entry)
 	gen := newGenerator(filter, domains)
 	go scanDatabases(dsn, names, ndbworkers, gen)
-	go probeUrls(domains, broken, nprobeworkers)
+	go probeUrls(domains, broken, nprobeworkers, nretries)
 	for entry := range broken {
 		fmt.Printf("%s\n", entry.toCsv())
 	}
